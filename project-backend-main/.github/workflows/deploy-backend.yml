@@ -1,0 +1,123 @@
+# Build → Push to Docker Hub → Deploy to AWS EC2
+# Run from project-backend repo root
+name: Build → Push to Docker Hub → Deploy
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push image (SHA + latest)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/campus-olx-backend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/campus-olx-backend:latest
+
+      - name: Start ssh-agent and add private key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+
+      - name: Deploy to EC2 with rollback support
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << ENDSSH
+          set -e
+
+          CONTAINER_NAME="campus-olx-backend"
+          ENV_FILE="campus-olx-backend.env"
+          IMAGE_NEW="${{ secrets.DOCKERHUB_USERNAME }}/campus-olx-backend:${{ github.sha }}"
+
+          echo "=========================================="
+          echo "🚀 Starting deployment - Campus OLX Backend"
+          echo "=========================================="
+
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+
+          CURRENT_IMAGE=""
+          if sudo docker inspect \$CONTAINER_NAME > /dev/null 2>&1; then
+            CURRENT_IMAGE=\$(sudo docker inspect --format='{{.Config.Image}}' \$CONTAINER_NAME)
+            echo "📦 Current image (for rollback): \$CURRENT_IMAGE"
+          fi
+
+          echo "🧹 Cleaning up disk space before pull..."
+          df -h / | tail -1
+          sudo docker container prune -f || true
+          sudo docker image prune -a -f --filter "until=24h" || true
+          sudo docker volume prune -f || true
+          sudo docker network prune -f || true
+          sudo docker builder prune -f || true
+          df -h / | tail -1
+
+          echo "📥 Pulling new image: \$IMAGE_NEW"
+          sudo docker pull \$IMAGE_NEW
+
+          echo ""
+          echo "=========================================="
+          echo "📦 Deploying Backend..."
+          echo "=========================================="
+
+          sudo docker stop \$CONTAINER_NAME || true
+          sudo docker rm \$CONTAINER_NAME || true
+
+          if sudo docker run -d --name \$CONTAINER_NAME --restart unless-stopped --env-file \$ENV_FILE -e PORT=5005 -p 5005:5005 \$IMAGE_NEW; then
+            echo "⏳ Waiting for backend container to be healthy..."
+            sleep 10
+            if sudo docker ps | grep -q \$CONTAINER_NAME; then
+              echo "✅ Backend deployment successful!"
+              sudo docker logs --tail=20 \$CONTAINER_NAME || true
+            else
+              echo "❌ Backend container stopped unexpectedly!"
+              sudo docker logs \$CONTAINER_NAME || true
+              if [ -n "\$CURRENT_IMAGE" ]; then
+                echo "🔄 Rolling back..."
+                sudo docker rm \$CONTAINER_NAME || true
+                sudo docker run -d --name \$CONTAINER_NAME --restart unless-stopped --env-file \$ENV_FILE -e PORT=5005 -p 5005:5005 \$CURRENT_IMAGE
+                echo "⚠️ Rollback completed."
+              fi
+              exit 1
+            fi
+          else
+            echo "❌ Failed to start backend container!"
+            if [ -n "\$CURRENT_IMAGE" ]; then
+              echo "🔄 Rolling back..."
+              sudo docker rm \$CONTAINER_NAME || true
+              sudo docker run -d --name \$CONTAINER_NAME --restart unless-stopped --env-file \$ENV_FILE -e PORT=5005 -p 5005:5005 \$CURRENT_IMAGE
+              echo "⚠️ Rollback completed."
+            fi
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "📊 Final Status"
+          echo "=========================================="
+          sudo docker ps | grep \$CONTAINER_NAME || echo "Container not found"
+          sudo docker image prune -a -f || true
+          df -h / | tail -1
+          echo ""
+          echo "=========================================="
+          echo "✅ Deployment complete!"
+          echo "=========================================="
+          ENDSSH
+        shell: bash
